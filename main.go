@@ -1,13 +1,25 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
+
+	_ "github.com/lib/pq"
 )
 
 func main() {
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Printf("Failed to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	dbQueries := database.New(db)
 	serveMux := http.NewServeMux()
 	httpServer := &http.Server{
 		Addr:    ":8080",
@@ -102,14 +114,15 @@ func (cfg *apiConfig) validateChirpHandler(w http.ResponseWriter, r *http.Reques
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
+	c.Message = sanitizeFilter(c.Message)
 	payload := struct {
-		Valid bool `json:"valid"`
+		CleanedBody string `json:"cleaned_body"`
 	}{
-		Valid: true,
+		CleanedBody: c.Message,
 	}
 	respondWithJSON(w, http.StatusOK, payload)
+	return
 }
-
 func respondWithError(w http.ResponseWriter, statusCode int, message string) {
 	w.WriteHeader(statusCode)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -134,4 +147,20 @@ func respondWithJSON(w http.ResponseWriter, statusCode int, payload interface{})
 		return
 	}
 	w.Write(jsonData)
+}
+
+func sanitizeFilter(message string) string {
+	profaneWords := []string{"kerfuffle", "sharbert", "fornax", "dingleberry", "bumfuzzle"}
+	for _, word := range profaneWords {
+		if strings.Contains(strings.ToLower(message), word) {
+			fields := strings.Fields(message)
+			for i, field := range fields {
+				if strings.EqualFold(field, word) {
+					fields[i] = "****"
+				}
+			}
+			message = strings.Join(fields, " ")
+		}
+	}
+	return message
 }

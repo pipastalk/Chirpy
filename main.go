@@ -65,8 +65,14 @@ func (cfg *apiConfig) userHandler() http.HandlerFunc {
 			respondWithError(w, http.StatusBadRequest, err.Error()) //TODO better error handle for server side errors / user not found etc
 			return
 		}
+		switch r.Method {
+		case "GET":
+			w.WriteHeader(http.StatusOK)
+		case "POST":
+			w.WriteHeader(http.StatusCreated)
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
+
 		w.Write(jsonData)
 	}
 }
@@ -192,6 +198,7 @@ func (cfg *apiConfig) fileServerHitsHandler(w http.ResponseWriter, r *http.Reque
 }
 
 func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
+	cfg.dbQueries.ResetUserDB(r.Context())
 	cfg.fileserverHits.Store(0)
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

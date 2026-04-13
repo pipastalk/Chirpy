@@ -42,7 +42,7 @@ func main() {
 	serveMux.Handle("/app/", apiMetrics.middlewareMetricsInc(fileServer))
 	serveMux.HandleFunc("GET /admin/metrics", middlewareAdminCalls(http.HandlerFunc(apiMetrics.fileServerHitsHandler)))
 	serveMux.HandleFunc("POST /admin/reset", middlewareAdminCalls(http.HandlerFunc(apiMetrics.resetHandler)))
-	serveMux.HandleFunc("POST /api/validate_chirp", middlewareAPICalls(http.HandlerFunc(apiMetrics.validateChirpHandler)))
+	serveMux.HandleFunc("POST /api/chirps", middlewareAPICalls(http.HandlerFunc(apiMetrics.postChirpHandler)))
 	serveMux.HandleFunc("POST /api/users", middlewareAPICalls(apiMetrics.userHandler()))
 	serveMux.HandleFunc("GET /api/users", middlewareAPICalls(apiMetrics.userHandler()))
 	httpServer.ListenAndServe()
@@ -75,16 +75,6 @@ func (cfg *apiConfig) userHandler() http.HandlerFunc {
 
 		w.Write(jsonData)
 	}
-}
-
-type userResponse struct {
-	ID        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt string    `json:"created_at"`
-	UpdatedAt string    `json:"updated_at"`
-}
-type userRequest struct {
-	Email string `json:"email"`
 }
 
 func validateUserRequest(req *http.Request) (userRequest, error) {
@@ -158,11 +148,6 @@ func readyCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(body))
 }
 
-type apiConfig struct {
-	fileserverHits atomic.Int32
-	dbQueries      *database.Queries
-}
-
 func middlewareAdminCalls(next http.Handler) http.HandlerFunc {
 	stripped := http.StripPrefix("/admin", next)
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -205,32 +190,69 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Hits reset\n"))
 }
 
-func (cfg *apiConfig) validateChirpHandler(w http.ResponseWriter, r *http.Request) {
-	type chirp struct {
-		Message string `json:"body"`
-	}
+type apiConfig struct {
+	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
+}
+type userResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt string    `json:"created_at"`
+	UpdatedAt string    `json:"updated_at"`
+}
+type userRequest struct {
+	Email string `json:"email"`
+}
+
+type chirpRequest struct {
+	Body   string    `json:"body"`
+	UserID uuid.UUID `json:"user_id"`
+}
+type chirpResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Body      string    `json:"body"`
+	CreatedAt string    `json:"created_at"`
+	UpdatedAt string    `json:"updated_at"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+func (cfg *apiConfig) postChirpHandler(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
-	var c chirp
-	if err := decoder.Decode(&c); err != nil {
+	var cReq chirpRequest
+	if err := decoder.Decode(&cReq); err != nil {
 		respondWithError(w, http.StatusNoContent, "Invalid JSON")
 		return
 	}
-	if len(c.Message) == 0 {
+	if _, err := cfg.dbQueries.GetUserByID(r.Context(), cReq.UserID); err != nil {
+		respondWithError(w, http.StatusBadRequest, "User not found")
+		return
+	}
+	if len(cReq.Body) == 0 {
 		respondWithError(w, http.StatusBadRequest, "Message cannot be empty")
 		return
 	}
 	charLimit := 140
-	if len(c.Message) > charLimit {
+	if len(cReq.Body) > charLimit {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
-	c.Message = sanitizeFilter(c.Message)
-	payload := struct {
-		CleanedBody string `json:"cleaned_body"`
-	}{
-		CleanedBody: c.Message,
+	cReq.Body = sanitizeFilter(cReq.Body)
+	dbPost, err := cfg.dbQueries.CreatePost(r.Context(), database.CreatePostParams{
+		Body:   cReq.Body,
+		UserID: cReq.UserID,
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to create post")
+		return
 	}
-	respondWithJSON(w, http.StatusOK, payload)
+	cRes := chirpResponse{
+		ID:        dbPost.ID,
+		Body:      dbPost.Body,
+		CreatedAt: dbPost.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt: dbPost.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UserID:    dbPost.UserID,
+	}
+	respondWithJSON(w, http.StatusCreated, cRes)
 }
 func respondWithError(w http.ResponseWriter, statusCode int, message string) {
 	w.WriteHeader(statusCode)

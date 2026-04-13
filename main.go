@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/mail"
 	"os"
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"github.com/pipastalk/Chirpy/internal/database"
 )
 
 func main() {
+	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -20,6 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 	dbQueries := database.New(db)
+
 	serveMux := http.NewServeMux()
 	httpServer := &http.Server{
 		Addr:    ":8080",
@@ -27,6 +33,7 @@ func main() {
 	}
 	apiMetrics := &apiConfig{
 		fileserverHits: atomic.Int32{},
+		dbQueries:      dbQueries,
 	}
 
 	fileServer := fileServerHandler()
@@ -36,8 +43,103 @@ func main() {
 	serveMux.HandleFunc("GET /admin/metrics", middlewareAdminCalls(http.HandlerFunc(apiMetrics.fileServerHitsHandler)))
 	serveMux.HandleFunc("POST /admin/reset", middlewareAdminCalls(http.HandlerFunc(apiMetrics.resetHandler)))
 	serveMux.HandleFunc("POST /api/validate_chirp", middlewareAPICalls(http.HandlerFunc(apiMetrics.validateChirpHandler)))
+	serveMux.HandleFunc("POST /api/users", middlewareAPICalls(apiMetrics.userHandler()))
+	serveMux.HandleFunc("GET /api/users", middlewareAPICalls(apiMetrics.userHandler()))
 	httpServer.ListenAndServe()
 }
+
+func (cfg *apiConfig) userHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		registry := map[string]func(*http.Request) ([]byte, error){
+			"POST": cfg.createUserFromEmail,
+			"GET":  cfg.getUserFromEmail,
+		}
+		handlerFunc, exists := registry[r.Method]
+		if !exists {
+			respondWithError(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		jsonData, err := handlerFunc(r)
+
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, err.Error()) //TODO better error handle for server side errors / user not found etc
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write(jsonData)
+	}
+}
+
+type userResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt string    `json:"created_at"`
+	UpdatedAt string    `json:"updated_at"`
+}
+type userRequest struct {
+	Email string `json:"email"`
+}
+
+func validateUserRequest(req *http.Request) (userRequest, error) {
+	expectedReq := userRequest{}
+	decoder := json.NewDecoder(req.Body)
+	if err := decoder.Decode(&expectedReq); err != nil {
+		return userRequest{}, fmt.Errorf("failed to decode request body: %w", err)
+	}
+	_, err := mail.ParseAddress(expectedReq.Email)
+	if err != nil {
+		return userRequest{}, fmt.Errorf("invalid email address: %w", err)
+	}
+	return expectedReq, nil
+}
+
+func (cfg *apiConfig) createUserFromEmail(req *http.Request) (jsonData []byte, err error) {
+	userReq, err := validateUserRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	dbUser, err := cfg.dbQueries.CreateUser(req.Context(), userReq.Email)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+	jsonData, err = createUserResponse(dbUser)
+	if err != nil {
+		return nil, err
+	}
+	return jsonData, nil
+}
+
+func (cfg *apiConfig) getUserFromEmail(req *http.Request) (jsonData []byte, err error) {
+	userReq, err := validateUserRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	dbUser, err := cfg.dbQueries.GetUser(req.Context(), userReq.Email)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve user: %w", err)
+	}
+	jsonData, err = createUserResponse(dbUser)
+	if err != nil {
+		return nil, err
+	}
+	return jsonData, nil
+}
+
+func createUserResponse(dbUser database.User) ([]byte, error) {
+	response := userResponse{
+		ID:        dbUser.ID,
+		Email:     dbUser.Email,
+		CreatedAt: dbUser.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt: dbUser.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal user data: %w", err)
+	}
+	return jsonData, nil
+}
+
 func fileServerHandler() http.Handler {
 	return http.Handler(http.StripPrefix("/app", http.FileServer(http.Dir("."))))
 }
@@ -52,6 +154,7 @@ func readyCheck(w http.ResponseWriter, r *http.Request) {
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
 }
 
 func middlewareAdminCalls(next http.Handler) http.HandlerFunc {
@@ -121,7 +224,6 @@ func (cfg *apiConfig) validateChirpHandler(w http.ResponseWriter, r *http.Reques
 		CleanedBody: c.Message,
 	}
 	respondWithJSON(w, http.StatusOK, payload)
-	return
 }
 func respondWithError(w http.ResponseWriter, statusCode int, message string) {
 	w.WriteHeader(statusCode)

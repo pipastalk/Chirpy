@@ -14,6 +14,7 @@ import (
 const getChirpByUser = `-- name: GetChirpByUser :many
 SELECT id, created_at, updated_at, body, user_id FROM posts
 WHERE user_id = $1
+ORDER BY created_at ASC
 `
 
 func (q *Queries) GetChirpByUser(ctx context.Context, userID uuid.UUID) ([]Post, error) {

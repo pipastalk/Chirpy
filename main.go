@@ -718,5 +718,3 @@ func (cfg *apiConfig) revokeRefreshToken(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
-
-// SIGN OFF, chirpsHandler sort is not working on descending, it may only work on ascending as that is the default, debug this

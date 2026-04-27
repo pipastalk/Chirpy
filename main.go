@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/mail"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,11 @@ func main() {
 		fmt.Printf("Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
+	polkaKey := os.Getenv("POLKA_KEY")
+	if polkaKey == "" {
+		fmt.Println("Polka key is not set in environment variables")
+		os.Exit(1)
+	}
 	dbQueries := database.New(db)
 
 	serveMux := http.NewServeMux()
@@ -42,9 +48,11 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		dbQueries:      dbQueries,
 		jwtSecret:      jwtSecret,
+		polkaKey:       polkaKey,
 	}
 
 	fileServer := fileServerHandler()
+	//region API routes
 	readiness := http.HandlerFunc(readyCheck)
 	serveMux.HandleFunc("GET /api/healthz", middlewareAPICalls(readiness))
 	serveMux.Handle("/app/", apiMetrics.middlewareMetricsInc(fileServer))
@@ -55,80 +63,36 @@ func main() {
 	serveMux.HandleFunc("POST /api/users", middlewareAPICalls(apiMetrics.userHandler()))
 	serveMux.HandleFunc("GET /api/users", middlewareAPICalls(apiMetrics.userHandler()))
 	serveMux.HandleFunc("PUT /api/users", middlewareAPICalls(http.HandlerFunc(apiMetrics.updateUser)))
+	serveMux.HandleFunc("POST /api/polka/webhooks", middlewareAPICalls(http.HandlerFunc(apiMetrics.enableChirpyRed)))
 	serveMux.HandleFunc("GET /api/chirps", middlewareAPICalls(http.HandlerFunc(apiMetrics.getChirpsHandler)))
 	serveMux.HandleFunc("GET /api/chirps/{chirpID}", middlewareAPICalls(http.HandlerFunc(apiMetrics.getChirpsHandler)))
+	serveMux.HandleFunc("DELETE /api/chirps/{chirpID}", middlewareAPICalls(http.HandlerFunc(apiMetrics.deleteChirp)))
 	serveMux.HandleFunc("POST /api/refresh", middlewareAPICalls(http.HandlerFunc(apiMetrics.refreshTokenHandler)))
 	serveMux.HandleFunc("POST /api/revoke", middlewareAPICalls(http.HandlerFunc(apiMetrics.revokeRefreshToken)))
-
+	//endregion
 	httpServer.ListenAndServe()
 }
 
-func (cfg *apiConfig) getUserChirps(w http.ResponseWriter, r *http.Request) {
-	expectedReq := struct {
-		UserID uuid.UUID `json:"user_id"`
-	}{}
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&expectedReq); err != nil {
-		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("failed to decode request body: %v", err))
-		return
-	}
+type httpErrors struct {
+	httpStatus int
+	message    string
+}
 
-	chirps, err := cfg.dbQueries.GetChirpByUser(r.Context(), expectedReq.UserID)
+func (cfg *apiConfig) getUserChirps(r *http.Request) ([]chirpResponse, httpErrors) {
+	authorID := r.URL.Query().Get("author_id")
+	if authorID == "" {
+		return nil, httpErrors{httpStatus: http.StatusBadRequest, message: "Missing author_id parameter"}
+	}
+	userID, err := uuid.Parse(authorID)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirps")
-		return
+		return nil, httpErrors{httpStatus: http.StatusBadRequest, message: "Invalid author_id parameter"}
+	}
+	chirps, err := cfg.dbQueries.GetChirpByUser(r.Context(), userID)
+	if err != nil {
+		return nil, httpErrors{httpStatus: http.StatusInternalServerError, message: "Failed to retrieve chirps"}
 	}
 	if len(chirps) == 0 {
-		respondWithError(w, http.StatusNotFound, "No chirps found")
-		return
-	}
-	response := []chirpResponse{}
-	for i, chirp := range chirps {
-		response[i] = chirpResponse{
-			ID:        chirp.ID,
-			UserID:    chirp.UserID,
-			Body:      chirp.Body,
-			CreatedAt: chirp.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			UpdatedAt: chirp.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		}
-	}
-	respondWithJSON(w, http.StatusOK, response)
-}
-func (cfg *apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("chirpID")
-	post_id, err := uuid.Parse(id)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
-		return
-	}
-	chirp, err := cfg.dbQueries.GetChirp(r.Context(), post_id)
-	if err != nil {
-		respondWithError(w, http.StatusNotFound, "Failed to retrieve chirps")
-		return
-	}
-	cRes := chirpResponse{
-		ID:        chirp.ID,
-		UserID:    chirp.UserID,
-		Body:      chirp.Body,
-		CreatedAt: chirp.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedAt: chirp.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-	}
-	respondWithJSON(w, http.StatusOK, cRes)
-}
-func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
-	if id := r.PathValue("chirpID"); id != "" { //Individual chirp request
-		cfg.getChirp(w, r)
-		return
-	}
-	//all chirps request
-	chirps, err := cfg.dbQueries.GetChirps(r.Context())
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirps")
-		return
-	}
-	if len(chirps) == 0 {
-		respondWithError(w, http.StatusNotFound, "No chirps found")
-		return
+		return nil, httpErrors{httpStatus: http.StatusNotFound, message: "No chirps found"}
 	}
 	response := make([]chirpResponse, len(chirps))
 	for i, chirp := range chirps {
@@ -136,11 +100,138 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
 			ID:        chirp.ID,
 			UserID:    chirp.UserID,
 			Body:      chirp.Body,
-			CreatedAt: chirp.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			UpdatedAt: chirp.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			CreatedAt: chirp.CreatedAt.Format(time.RFC3339Nano),
+			UpdatedAt: chirp.UpdatedAt.Format(time.RFC3339Nano),
 		}
 	}
+	return response, httpErrors{}
+}
+func (cfg *apiConfig) getChirp(r *http.Request) (chirpResponse, httpErrors) {
+	id := r.PathValue("chirpID")
+	post_id, err := uuid.Parse(id)
+	if err != nil {
+		return chirpResponse{}, httpErrors{httpStatus: http.StatusBadRequest, message: "Invalid chirp ID"}
+	}
+	chirp, err := cfg.dbQueries.GetChirp(r.Context(), post_id)
+	if err != nil {
+		return chirpResponse{}, httpErrors{httpStatus: http.StatusNotFound, message: "Failed to retrieve chirps"}
+	}
+	cRes := chirpResponse{
+		ID:        chirp.ID,
+		UserID:    chirp.UserID,
+		Body:      chirp.Body,
+		CreatedAt: chirp.CreatedAt.Format(time.RFC3339Nano),
+		UpdatedAt: chirp.UpdatedAt.Format(time.RFC3339Nano),
+	}
+	return cRes, httpErrors{}
+}
+
+func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("chirpID")
+	authorID := r.URL.Query().Get("author_id")
+	var response []chirpResponse
+	if id != "" { //Individual chirp request
+		chrip, err := cfg.getChirp(r)
+		if err != (httpErrors{}) {
+			respondWithError(w, err.httpStatus, err.message)
+			return
+		}
+		response = append(response, chrip)
+	} else if authorID != "" { //chirps by user request
+		res, err := cfg.getUserChirps(r)
+		if err != (httpErrors{}) {
+			respondWithError(w, err.httpStatus, err.message)
+			return
+		}
+		response = append(response, res...)
+	} else { //all chirps
+		res, err := cfg.getAllChirps(r)
+		if err != (httpErrors{}) {
+			respondWithError(w, err.httpStatus, err.message)
+			return
+		}
+		response = append(response, res...)
+	}
+	sortMethod := r.URL.Query().Get("sort")
+	switch sortMethod {
+	case "asc":
+		sort.Slice(response, func(i, j int) bool {
+			timeI, errI := time.Parse(time.RFC3339Nano, response[i].CreatedAt)
+			timeJ, errJ := time.Parse(time.RFC3339Nano, response[j].CreatedAt)
+			if errI != nil || errJ != nil {
+				return false // If parsing fails, maintain original order
+			}
+			if c := timeI.Compare(timeJ); c != 0 {
+				return c < 0
+			}
+			return false
+		})
+	case "desc":
+		sort.Slice(response, func(i, j int) bool {
+			timeI, errI := time.Parse(time.RFC3339Nano, response[i].CreatedAt)
+			timeJ, errJ := time.Parse(time.RFC3339Nano, response[j].CreatedAt)
+			if errI != nil || errJ != nil {
+				return false // If parsing fails, maintain original order
+			}
+			if c := timeI.Compare(timeJ); c != 0 {
+				return c > 0
+			}
+			return false
+		})
+	}
+	//default to no sorting
+
 	respondWithJSON(w, http.StatusOK, response)
+}
+
+func (cfg *apiConfig) getAllChirps(r *http.Request) ([]chirpResponse, httpErrors) {
+	chirps, err := cfg.dbQueries.GetChirps(r.Context())
+	if err != nil {
+		return nil, httpErrors{httpStatus: http.StatusInternalServerError, message: "Failed to retrieve chirps"}
+	}
+	if len(chirps) == 0 {
+		return nil, httpErrors{httpStatus: http.StatusNotFound, message: "No chirps found"}
+	}
+	response := make([]chirpResponse, len(chirps))
+	for i, chirp := range chirps {
+		response[i] = chirpResponse{
+			ID:        chirp.ID,
+			UserID:    chirp.UserID,
+			Body:      chirp.Body,
+			CreatedAt: chirp.CreatedAt.Format(time.RFC3339Nano),
+			UpdatedAt: chirp.UpdatedAt.Format(time.RFC3339Nano),
+		}
+	}
+	return response, httpErrors{}
+}
+func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("chirpID")
+	post_id, err := uuid.Parse(id)
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid Authorization header")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Invalid token")
+		return
+	}
+	chirp, err := cfg.dbQueries.GetChirp(r.Context(), post_id)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+		return
+	}
+	if chirp.UserID != userID {
+		respondWithError(w, http.StatusForbidden, "You do not have permission to delete this chirp")
+		return
+	}
+	err = cfg.dbQueries.DeleteChirp(r.Context(), post_id)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Failed to find chirp")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (cfg *apiConfig) loginUserFromEmailHandler(w http.ResponseWriter, req *http.Request) {
@@ -197,12 +288,50 @@ func (cfg *apiConfig) loginUserFromEmailHandler(w http.ResponseWriter, req *http
 	}
 	respondWithError(w, http.StatusUnauthorized, failedLoginMsg)
 }
+
+type ChirpyRedRequest struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserID uuid.UUID `json:"user_id"`
+	} `json:"data"`
+}
+
+func (cfg *apiConfig) enableChirpyRed(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(r.Body)
+	var crReq ChirpyRedRequest
+	if err := decoder.Decode(&crReq); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	if crReq.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil || apiKey != cfg.polkaKey {
+		respondWithError(w, http.StatusUnauthorized, "Missing or invalid API key")
+		return
+	}
+	if apiKey != cfg.polkaKey {
+		respondWithError(w, http.StatusUnauthorized, "Invalid API key")
+		return
+	}
+	_, err = cfg.dbQueries.EnableUserChripyRed(r.Context(), crReq.Data.UserID)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "User not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+
+}
+
 func (cfg *apiConfig) updateUser(w http.ResponseWriter, req *http.Request) {
 	userReq, err := validateUserRequest(req)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Invalid Request")
 		return
 	}
+	//region checks
 	access_token, err := auth.GetBearerToken(req.Header)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, "Missing or invalid Authorization header")
@@ -222,15 +351,35 @@ func (cfg *apiConfig) updateUser(w http.ResponseWriter, req *http.Request) {
 		respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
 		return
 	}
-	dbUser, err := cfg.dbQueries.UpdateUser(req.Context(), database.UpdateUserParams{
+	existingUser, err := cfg.dbQueries.GetUserByID(req.Context(), userID)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to retrieve user")
+		return
+	}
+	if existingUser == (database.User{}) {
+		respondWithError(w, http.StatusNotFound, "User not found")
+		return
+	}
+	//endregion
+	//region  UPDATES to User
+	updates := database.UpdateUserAuthenticationParams{
 		ID:       userID,
-		Email:    userReq.Email,
-		Password: hashedPassword,
-	})
+		Email:    existingUser.Email,
+		Password: existingUser.Password,
+	}
+	// currently can update both email and password together
+	if userReq.Email != updates.Email && userReq.Email != "" {
+		updates.Email = userReq.Email
+	}
+	if userReq.Password != "" && userReq.Password != existingUser.Password {
+		updates.Password = hashedPassword
+	}
+	dbUser, err := cfg.dbQueries.UpdateUserAuthentication(req.Context(), updates)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to update user")
 		return
 	}
+	//endregion
 	jsonData, err := createUserResponse(dbUser, "", "")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to create response")
@@ -330,6 +479,7 @@ func createUserResponse(dbUser database.User, bearer_token string, refresh_token
 		UpdatedAt:    dbUser.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		Token:        bearer_token,
 		RefreshToken: refresh_token,
+		ChripyRed:    dbUser.IsChirpyRed,
 	}
 	jsonData, err := json.Marshal(response)
 	if err != nil {
@@ -396,6 +546,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	jwtSecret      string
+	polkaKey       string
 }
 type userResponse struct {
 	ID           uuid.UUID `json:"id"`
@@ -404,6 +555,7 @@ type userResponse struct {
 	UpdatedAt    string    `json:"updated_at"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	ChripyRed    bool      `json:"is_chirpy_red"`
 }
 type userRequest struct {
 	Email            string `json:"email"`
@@ -487,8 +639,8 @@ func respondWithError(w http.ResponseWriter, statusCode int, message string) {
 }
 
 func respondWithJSON(w http.ResponseWriter, statusCode int, payload interface{}) {
-	w.WriteHeader(statusCode)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(statusCode)
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to encode response")
@@ -567,4 +719,4 @@ func (cfg *apiConfig) revokeRefreshToken(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// SIGN OFF, Need to fill out update_user.sql so that cfg.updateUser works
+// SIGN OFF, chirpsHandler sort is not working on descending, it may only work on ascending as that is the default, debug this
